@@ -783,7 +783,9 @@ def _supplement_original_core_indicators(
                 if col in {"date", "trade_date"}:
                     continue
                 if col not in base.columns:
-                    base[col] = np.nan
+                    base[col] = pd.Series(dtype=object)
+                elif isinstance(value, str) and not pd.api.types.is_object_dtype(base[col]):
+                    base[col] = base[col].astype(object)
                 base.loc[mask, col] = value
 
     if index_history_df is not None and not index_history_df.empty:
@@ -829,8 +831,6 @@ def _prepare_daily_panel(daily_map: Dict[str, pd.DataFrame], trade_dates: List[s
         if col in all_daily.columns:
             all_daily[col] = _numeric_col(all_daily, col)
     valid = all_daily["close"].notna() & (all_daily["close"] > 0)
-    if "pre_close" in all_daily.columns:
-        valid &= all_daily["pre_close"].notna() & (all_daily["pre_close"] > 0)
     if "vol" in all_daily.columns:
         valid &= all_daily["vol"].fillna(0) > 0
     all_daily = all_daily.loc[valid].copy()
@@ -957,9 +957,6 @@ def build_afgi_enhanced_timeseries(
     if local_dates:
         trade_dates = sorted(set(trade_dates).union(local_dates))
     trade_dates = [date for date in trade_dates if date <= end_date]
-    target_dates = [date for date in trade_dates if start_date <= date <= end_date]
-    if not target_dates:
-        return _filter_date_range(_neutral_enhanced_from_original(original), start_date, end_date)
 
     stock_basic = load_stock_basic_safe(token)
     daily_map: Dict[str, pd.DataFrame] = {}
@@ -969,6 +966,11 @@ def build_afgi_enhanced_timeseries(
         if progress_callback is not None:
             data_scope = "前置计算" if trade_date < start_date else "所选区间"
             progress_callback(position, total_trade_dates, f"正在获取历史行情（{data_scope}）{trade_date}")
+    trade_dates = [date for date in trade_dates if not daily_map[date].empty]
+    target_dates = [date for date in trade_dates if start_date <= date <= end_date]
+    if not target_dates:
+        return pd.DataFrame()
+
     index_history = _build_index_history(token, original, source_start, end_date)
     original = _supplement_original_core_indicators(
         token,
@@ -1074,10 +1076,23 @@ def update_enhanced_afgi_cache(
 
     try:
         target_dates = set(load_trade_dates(token, start_date, end_date)) if token else set()
+        target_dates_loaded = bool(token)
     except Exception:
         target_dates = set()
+        target_dates_loaded = False
     target_dates = target_dates.union(local_target_dates)
+    all_cached_dates = set(cache_df.get("trade_date", pd.Series(dtype=str)).astype(str)) if not cache_df.empty else set()
     cached_dates = _effective_cached_dates(cache_df, token or ("local" if local_target_dates else ""))
+    invalid_cached_dates = all_cached_dates - cached_dates
+    unavailable_cached_dates = {
+        trade_date
+        for trade_date in invalid_cached_dates
+        if start_date <= trade_date <= end_date and trade_date not in target_dates
+    } if target_dates_loaded or local_target_dates else set()
+    cache_changed = bool(unavailable_cached_dates)
+    if cache_changed:
+        cache_df = cache_df.loc[~cache_df["trade_date"].isin(unavailable_cached_dates)].copy()
+
     missing_dates = sorted(target_dates - cached_dates)
     if force_update:
         missing_dates = sorted(target_dates)
@@ -1095,6 +1110,10 @@ def update_enhanced_afgi_cache(
             force_update=force_update,
             progress_callback=progress_callback,
         )
+        new_dates = set(new_df.get("trade_date", pd.Series(dtype=str)).astype(str)) if not new_df.empty else set()
+        unavailable_attempts = (set(missing_dates) - new_dates) & invalid_cached_dates
+        if unavailable_attempts and not cache_df.empty:
+            cache_df = cache_df.loc[~cache_df["trade_date"].isin(unavailable_attempts)].copy()
         combined = pd.concat([cache_df, new_df], ignore_index=True, sort=False) if not cache_df.empty else new_df
         if not combined.empty and "trade_date" in combined.columns:
             combined["trade_date"] = combined["trade_date"].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(8)
@@ -1102,12 +1121,21 @@ def update_enhanced_afgi_cache(
             # fallback rows before the normal date sorting in finalization.
             combined = combined.drop_duplicates(subset=["trade_date"], keep="last").reset_index(drop=True)
         combined = _finalize_enhanced_scores(combined)
-        save_enhanced_cache(combined, cache_path)
+        if combined.empty:
+            cache_path.unlink(missing_ok=True)
+        else:
+            save_enhanced_cache(combined, cache_path)
         cache_df = combined
         if progress_callback is not None:
             progress_callback(len(missing_dates), len(missing_dates), "市场情绪缓存更新完成")
-    elif progress_callback is not None:
-        progress_callback(1, 1, "当前区间没有需要补算的交易日")
+    else:
+        if cache_changed:
+            if cache_df.empty:
+                cache_path.unlink(missing_ok=True)
+            else:
+                save_enhanced_cache(cache_df, cache_path)
+        if progress_callback is not None:
+            progress_callback(1, 1, "当前区间没有需要补算的交易日")
 
     return _filter_date_range(cache_df, start_date, end_date)
 

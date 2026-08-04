@@ -581,15 +581,17 @@ def load_futures_basis_proxy(token: str, start_date: str, end_date: str) -> pd.D
 
 def load_market_fear_greed_source_data(token: str, start_date: str, end_date: str) -> Dict[str, object]:
     """读取 AFGI 所需的原始数据，所有外部源失败都返回空表。"""
-    trade_dates = load_trade_dates(token, start_date, end_date)
+    calendar_dates = load_trade_dates(token, start_date, end_date)
+    available_trade_dates = []
     daily_frames = []
-    for trade_date in trade_dates:
+    for trade_date in calendar_dates:
         daily = load_all_stock_daily(token, trade_date)
         if not daily.empty:
+            available_trade_dates.append(trade_date)
             daily_frames.append(daily)
     index_frames = {key: load_index_daily(token, code, start_date, end_date) for key, code in INDEX_CODES.items()}
     return {
-        "trade_dates": trade_dates,
+        "trade_dates": available_trade_dates,
         "stock_basic": load_stock_basic_safe(token),
         "daily": pd.concat(daily_frames, ignore_index=True) if daily_frames else pd.DataFrame(),
         "index": index_frames,

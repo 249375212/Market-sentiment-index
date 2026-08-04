@@ -21,7 +21,15 @@ from market_fear_greed.charts import (
     make_gauge,
     make_history_chart,
 )
+from market_fear_greed.pg_adapter import (
+    install_pg_adapter,
+    is_enabled as _pg_data_source_enabled,
+)
 from market_fear_greed.tushare_client import get_default_token
+
+if _pg_data_source_enabled():
+    # 启用本地 PostgreSQL 数据源，完全绕过 Tushare/AkShare
+    install_pg_adapter()
 
 
 st.set_page_config(page_title="A股市场情绪指数", layout="wide", initial_sidebar_state="expanded")
@@ -177,8 +185,12 @@ def _sidebar() -> tuple[str, str]:
             help="建议通过环境变量 TUSHARE_TOKEN 或 .streamlit/secrets.toml 配置。",
         ).strip()
         overlay = st.selectbox("叠加指数", ("沪深300", "上证指数", "中证1000", "创业板指"))
-        st.info("请使用至少5000积分的 Tushare Token。")
-        st.caption("页面启动只读取本地缓存，只有点击主界面的更新按钮后才会联网。")
+        if _pg_data_source_enabled():
+            st.success("已启用本地 PostgreSQL 数据源（reasonix_db），无需 Tushare Token。")
+            st.caption("数据全部来自本地数据库，点击主界面的更新按钮即可计算。")
+        else:
+            st.info("请使用至少5000积分的 Tushare Token。")
+            st.caption("页面启动只读取本地缓存，只有点击主界面的更新按钮后才会联网。")
     return token, overlay
 
 
@@ -205,6 +217,9 @@ def _main_date_range(today: date) -> tuple[str, date, date]:
 
 def main() -> None:
     token, overlay = _sidebar()
+    if _pg_data_source_enabled() and not token:
+        # PostgreSQL 本地数据库模式不需要 Tushare Token，用占位符绕过空值校验
+        token = "PG_LOCAL"
     st.markdown('<div class="app-title">A股市场情绪指数</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="app-subtitle">九大分项刻画波动、成交、价格、风险偏好与 A 股赚钱效应</div>',

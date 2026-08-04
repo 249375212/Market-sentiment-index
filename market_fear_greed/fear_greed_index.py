@@ -68,7 +68,9 @@ def _apply_status_fallback(df: pd.DataFrame, score_col: str, status_col: str) ->
 
     message_col = status_col.replace("_status", "_message")
     if message_col not in df.columns:
-        df[message_col] = ""
+        df[message_col] = pd.Series(dtype=object)
+    elif not pd.api.types.is_object_dtype(df[message_col]):
+        df[message_col] = df[message_col].astype(object)
     stale_dates = source_dates.loc[stale_mask].astype(str).str.replace(r"\.0$", "", regex=True)
     df.loc[stale_mask, message_col] = "当日数据源暂不可用，沿用最近有效交易日 " + stale_dates
 

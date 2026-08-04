@@ -49,6 +49,18 @@ def _filter_date_range(df: pd.DataFrame, start_date: str, end_date: str) -> pd.D
     return out.loc[(out["date"] >= start_ts) & (out["date"] <= end_ts)].sort_values("date").reset_index(drop=True)
 
 
+def _cached_dates_with_market_data(cache_df: pd.DataFrame) -> set[str]:
+    """Return cached dates backed by actual all-stock daily turnover."""
+    if cache_df is None or cache_df.empty or "trade_date" not in cache_df.columns:
+        return set()
+    if "total_amount" not in cache_df.columns:
+        return set(cache_df["trade_date"].astype(str))
+    valid = pd.to_numeric(cache_df["total_amount"], errors="coerce").gt(0)
+    if "volume_source" in cache_df.columns:
+        valid &= cache_df["volume_source"].fillna("").astype(str).str.contains("全A", regex=False)
+    return set(cache_df.loc[valid, "trade_date"].astype(str))
+
+
 def update_fear_greed_cache(token: str, start_date: str, end_date: str, force_update: bool = False, cache_path: Path = AFGI_CACHE_PATH) -> pd.DataFrame:
     """
     增量更新 AFGI 缓存。
@@ -81,13 +93,28 @@ def update_fear_greed_cache(token: str, start_date: str, end_date: str, force_up
         return _filter_date_range(cache_df, start_date, end_date)
 
     target_dates = set(load_trade_dates(token, start_date, end_date))
-    cached_dates = set(cache_df.get("trade_date", pd.Series(dtype=str)).astype(str)) if not cache_df.empty else set()
+    all_cached_dates = set(cache_df.get("trade_date", pd.Series(dtype=str)).astype(str)) if not cache_df.empty else set()
+    cached_dates = _cached_dates_with_market_data(cache_df)
+    invalid_cached_dates = all_cached_dates - cached_dates
+    unavailable_cached_dates = {
+        trade_date
+        for trade_date in invalid_cached_dates
+        if start_date <= trade_date <= end_date and trade_date not in target_dates
+    }
+    cache_changed = bool(unavailable_cached_dates)
+    if cache_changed:
+        cache_df = cache_df.loc[~cache_df["trade_date"].isin(unavailable_cached_dates)].copy()
+
     missing_dates = sorted(target_dates - cached_dates)
     if force_update or cache_needs_rescore:
         missing_dates = sorted(target_dates)
     if missing_dates:
         source_start = (pd.to_datetime(missing_dates[0]) - pd.Timedelta(days=430)).strftime("%Y%m%d")
         new_df = build_fear_greed_timeseries(token, source_start, end_date)
+        new_dates = set(new_df.get("trade_date", pd.Series(dtype=str)).astype(str)) if not new_df.empty else set()
+        unavailable_attempts = (set(missing_dates) - new_dates) & invalid_cached_dates
+        if unavailable_attempts and not cache_df.empty:
+            cache_df = cache_df.loc[~cache_df["trade_date"].isin(unavailable_attempts)].copy()
         combined = pd.concat([cache_df, new_df], ignore_index=True, sort=False) if not cache_df.empty else new_df
         combined = combined.drop_duplicates(subset=["trade_date"], keep="last").sort_values("trade_date").reset_index(drop=True)
         # 重新评分可以保证历史窗口在合并旧缓存后连续；旧缓存中已有 score 时也不会破坏原始字段。
@@ -96,6 +123,8 @@ def update_fear_greed_cache(token: str, start_date: str, end_date: str, force_up
             rescored[col] = combined[col]
         save_cache(rescored, cache_path)
         cache_df = rescored
+    elif cache_changed:
+        save_cache(cache_df, cache_path)
     return _filter_date_range(cache_df, start_date, end_date)
 
 
