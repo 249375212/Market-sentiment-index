@@ -327,12 +327,26 @@ _INDEX_SYMBOL_BY_TSCODE = {
 }
 # index_daily 中缺失、需用成分股加权聚合的指数
 _AGGREGATE_INDEX_SYMBOLS = {"000852", "000905"}
+# 交易所指数偶尔比 stock_daily 少最后一个交易日，用本地股票市值加权收益连续延伸。
+_INDEX_TAIL_PROXY_FILTERS = {
+    "000001": "sm.exchange = 'XSHG'",
+    "399006": "sm.exchange = 'XSHE' AND (sm.symbol LIKE '300%%' OR sm.symbol LIKE '301%%')",
+}
+_INDEX_TAIL_PROXY_SHARES = {
+    "000001": "v.total_shares",
+    "399006": "v.float_shares",
+}
 
 
 def pg_load_index_daily(
     token: str, ts_code: str, start_date: str, end_date: str
 ) -> pd.DataFrame:
-    """指数日线。中证1000/500 在 index_daily 缺失时用成分股加权聚合。"""
+    """指数日线。
+
+    中证1000/500 整段缺失时用成分股加权聚合；上证指数/创业板指若仅尾部
+    少于本地股票交易日，则以最后一个真实指数收盘价为锚，用本地股票市值
+    加权收益连续延伸，避免把股票均价误当成指数点位。
+    """
     start, end = _to_date_str(start_date), _to_date_str(end_date)
     sym = _INDEX_SYMBOL_BY_TSCODE.get(ts_code, ts_code.split(".")[0])
 
@@ -347,6 +361,8 @@ def pg_load_index_daily(
             ORDER BY trade_date
         """
         df = _query_df(sql, (sym, start, end))
+        if sym in _INDEX_TAIL_PROXY_FILTERS:
+            df = _extend_index_tail_from_stock_returns(df, sym, start, end)
         if df.empty and sym in _AGGREGATE_INDEX_SYMBOLS:
             df = _aggregate_index_by_constituents(sym, start, end)
         if df.empty and sym == "399006":
@@ -360,6 +376,133 @@ def pg_load_index_daily(
         return df[_DAILY_COLUMNS].sort_values("date").reset_index(drop=True)
 
     return _cached(("index_daily", ts_code, start, end), factory)
+
+
+def _load_index_tail_proxy_returns(
+    index_symbol: str, start_exclusive: str, end: str
+) -> pd.DataFrame:
+    """读取指数真实数据尾部之后的本地股票市值加权收益。"""
+    stock_filter = _INDEX_TAIL_PROXY_FILTERS.get(index_symbol)
+    shares = _INDEX_TAIL_PROXY_SHARES.get(index_symbol)
+    if not stock_filter or not shares:
+        return pd.DataFrame(columns=["trade_date", "date", "return_ratio"])
+
+    sql = f"""
+        WITH stock_returns AS (
+            SELECT d.trade_date,
+                   d.close_price / NULLIF(d.pre_close, 0) - 1.0 AS return_ratio,
+                   d.pre_close * {shares} AS previous_market_cap
+            FROM stock_daily d
+            JOIN security_master sm ON d.security_id = sm.security_id
+            JOIN stock_valuation_daily v
+              ON v.security_id = d.security_id AND v.trade_date = d.trade_date
+            WHERE {stock_filter}
+              AND sm.asset_type = 'stock_cn'
+              AND d.trade_date > to_date(%s, 'YYYYMMDD')
+              AND d.trade_date <= to_date(%s, 'YYYYMMDD')
+              AND d.close_price > 0
+              AND d.pre_close > 0
+              AND {shares} > 0
+        )
+        SELECT to_char(trade_date, 'YYYYMMDD') AS trade_date,
+               trade_date AS date,
+               SUM(return_ratio * previous_market_cap)
+                   / NULLIF(SUM(previous_market_cap), 0) AS return_ratio
+        FROM stock_returns
+        GROUP BY trade_date
+        ORDER BY trade_date
+    """
+    return _query_df(sql, (start_exclusive, end))
+
+
+def _extend_index_tail_from_stock_returns(
+    index_df: pd.DataFrame, index_symbol: str, start: str, end: str
+) -> pd.DataFrame:
+    """以最后一个真实指数点位为锚，仅合成其后的缺失交易日。"""
+    frame = index_df.copy() if index_df is not None else pd.DataFrame()
+    if not frame.empty:
+        frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+        frame["close_price"] = pd.to_numeric(frame["close_price"], errors="coerce")
+        anchors = frame.dropna(subset=["date", "close_price"]).sort_values("date")
+    else:
+        anchors = pd.DataFrame()
+
+    if anchors.empty:
+        anchor_sql = """
+            SELECT to_char(trade_date, 'YYYYMMDD') AS trade_date, trade_date AS date,
+                   open_price, high_price, low_price, close_price,
+                   pre_close, pct_change, volume, amount
+            FROM index_daily
+            WHERE symbol = %s
+              AND trade_date < to_date(%s, 'YYYYMMDD')
+            ORDER BY trade_date DESC
+            LIMIT 1
+        """
+        anchors = _query_df(anchor_sql, (index_symbol, start))
+        if anchors.empty:
+            return frame
+        anchors["date"] = pd.to_datetime(anchors["date"], errors="coerce")
+        anchors["close_price"] = pd.to_numeric(
+            anchors["close_price"], errors="coerce"
+        )
+        anchors = anchors.dropna(subset=["date", "close_price"]).sort_values("date")
+        if anchors.empty:
+            return frame
+
+    anchor = anchors.iloc[-1]
+    anchor_date = pd.Timestamp(anchor["date"])
+    if anchor_date >= pd.to_datetime(end):
+        return frame
+
+    proxy = _load_index_tail_proxy_returns(
+        index_symbol, anchor_date.strftime("%Y%m%d"), end
+    )
+    if proxy is None or proxy.empty:
+        return frame
+
+    proxy = proxy.copy()
+    proxy["date"] = pd.to_datetime(proxy["date"], errors="coerce")
+    proxy["return_ratio"] = pd.to_numeric(proxy["return_ratio"], errors="coerce")
+    proxy = proxy[
+        (proxy["date"] > anchor_date)
+        & proxy["date"].notna()
+        & proxy["return_ratio"].map(np.isfinite)
+    ].sort_values("date")
+    if proxy.empty:
+        return frame
+
+    previous_close = float(anchor["close_price"])
+    requested_start = pd.to_datetime(start)
+    synthetic_rows = []
+    for row in proxy.itertuples(index=False):
+        row_date = pd.Timestamp(row.date)
+        return_ratio = float(row.return_ratio)
+        close_price = previous_close * (1.0 + return_ratio)
+        if row_date < requested_start:
+            previous_close = close_price
+            continue
+        synthetic_rows.append(
+            {
+                "trade_date": row_date.strftime("%Y%m%d"),
+                "date": row_date,
+                "open_price": np.nan,
+                "high_price": np.nan,
+                "low_price": np.nan,
+                "close_price": close_price,
+                "pre_close": previous_close,
+                "pct_change": return_ratio * 100.0,
+                "volume": np.nan,
+                "amount": np.nan,
+            }
+        )
+        previous_close = close_price
+
+    if not synthetic_rows:
+        return frame
+    synthetic = pd.DataFrame(synthetic_rows)
+    if frame.empty:
+        return synthetic
+    return pd.concat([frame, synthetic], ignore_index=True)
 
 
 def _aggregate_index_by_constituents(

@@ -21,7 +21,11 @@ from market_fear_greed.enhanced_index import (
     load_enhanced_cache,
     update_enhanced_afgi_cache,
 )
-from market_fear_greed.pg_adapter import clear_cache, pg_load_trade_calendar
+from market_fear_greed.pg_adapter import (
+    clear_cache,
+    pg_load_index_daily,
+    pg_load_trade_calendar,
+)
 
 
 class DataAvailabilityTest(unittest.TestCase):
@@ -66,6 +70,129 @@ class DataAvailabilityTest(unittest.TestCase):
         self.assertEqual(result["sh_close"].tolist(), [3800.0, 3832.26])
         self.assertNotIn("sh_close_x", result.columns)
         self.assertNotIn("sh_close_y", result.columns)
+
+    def test_postgres_index_loader_extends_missing_tail_from_local_stock_returns(self):
+        cases = {
+            "000001.SH": (3832.26, 0.01),
+            "399006.SZ": (3343.96, -0.02),
+        }
+        for ts_code, (real_close, proxy_return) in cases.items():
+            with self.subTest(ts_code=ts_code):
+                clear_cache()
+                real_rows = pd.DataFrame(
+                    {
+                        "trade_date": ["20260731"],
+                        "date": [pd.Timestamp("2026-07-31")],
+                        "open_price": [real_close - 10.0],
+                        "high_price": [real_close + 10.0],
+                        "low_price": [real_close - 20.0],
+                        "close_price": [real_close],
+                        "pre_close": [real_close - 5.0],
+                        "pct_change": [0.13],
+                        "volume": [1000.0],
+                        "amount": [2000.0],
+                    }
+                )
+                proxy_rows = pd.DataFrame(
+                    {
+                        "trade_date": ["20260803"],
+                        "date": [pd.Timestamp("2026-08-03")],
+                        "return_ratio": [proxy_return],
+                    }
+                )
+
+                def query(sql, _params=None):
+                    if "FROM index_daily" in sql:
+                        return real_rows.copy()
+                    if "stock_valuation_daily" in sql:
+                        return proxy_rows.copy()
+                    self.fail(f"unexpected SQL: {sql}")
+
+                with patch("market_fear_greed.pg_adapter._query_df", side_effect=query):
+                    result = pg_load_index_daily(
+                        "PG_LOCAL", ts_code, "20260731", "20260803"
+                    )
+
+                self.assertEqual(result["trade_date"].tolist(), ["20260731", "20260803"])
+                self.assertAlmostEqual(result.loc[0, "close"], real_close)
+                self.assertAlmostEqual(
+                    result.loc[1, "close"], real_close * (1.0 + proxy_return)
+                )
+                self.assertAlmostEqual(result.loc[1, "pre_close"], real_close)
+                self.assertAlmostEqual(result.loc[1, "pct_chg"], proxy_return * 100.0)
+
+    def test_postgres_index_loader_keeps_real_tail_without_proxying(self):
+        clear_cache()
+        real_rows = pd.DataFrame(
+            {
+                "trade_date": ["20260731", "20260803"],
+                "date": pd.to_datetime(["2026-07-31", "2026-08-03"]),
+                "open_price": [3820.0, 3810.0],
+                "high_price": [3840.0, 3830.0],
+                "low_price": [3810.0, 3800.0],
+                "close_price": [3832.26, 3826.0],
+                "pre_close": [3804.69, 3832.26],
+                "pct_change": [0.724632, -0.16335],
+                "volume": [1000.0, 1100.0],
+                "amount": [2000.0, 2100.0],
+            }
+        )
+
+        def query(sql, _params=None):
+            if "FROM index_daily" in sql:
+                return real_rows.copy()
+            self.fail("real index tail must not be replaced by a stock proxy")
+
+        with patch("market_fear_greed.pg_adapter._query_df", side_effect=query):
+            result = pg_load_index_daily(
+                "PG_LOCAL", "000001.SH", "20260731", "20260803"
+            )
+
+        self.assertEqual(result["trade_date"].tolist(), ["20260731", "20260803"])
+        self.assertEqual(result["close"].tolist(), [3832.26, 3826.0])
+
+    def test_postgres_index_loader_can_extend_single_missing_incremental_date(self):
+        clear_cache()
+        anchor_close = 3832.26
+        anchor_row = pd.DataFrame(
+            {
+                "trade_date": ["20260731"],
+                "date": [pd.Timestamp("2026-07-31")],
+                "open_price": [3820.0],
+                "high_price": [3840.0],
+                "low_price": [3810.0],
+                "close_price": [anchor_close],
+                "pre_close": [3804.69],
+                "pct_change": [0.724632],
+                "volume": [1000.0],
+                "amount": [2000.0],
+            }
+        )
+        proxy_row = pd.DataFrame(
+            {
+                "trade_date": ["20260803"],
+                "date": [pd.Timestamp("2026-08-03")],
+                "return_ratio": [-0.001],
+            }
+        )
+
+        def query(sql, _params=None):
+            if "FROM index_daily" in sql and "ORDER BY trade_date DESC" in sql:
+                return anchor_row.copy()
+            if "FROM index_daily" in sql:
+                return pd.DataFrame()
+            if "stock_valuation_daily" in sql:
+                return proxy_row.copy()
+            self.fail(f"unexpected SQL: {sql}")
+
+        with patch("market_fear_greed.pg_adapter._query_df", side_effect=query):
+            result = pg_load_index_daily(
+                "PG_LOCAL", "000001.SH", "20260803", "20260803"
+            )
+
+        self.assertEqual(result["trade_date"].tolist(), ["20260803"])
+        self.assertAlmostEqual(result.loc[0, "close"], anchor_close * 0.999)
+        self.assertAlmostEqual(result.loc[0, "pre_close"], anchor_close)
 
     def test_postgres_trade_calendar_requires_downloaded_stock_daily(self):
         clear_cache()
