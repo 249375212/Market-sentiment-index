@@ -1137,6 +1137,41 @@ def update_enhanced_afgi_cache(
         if progress_callback is not None:
             progress_callback(1, 1, "当前区间没有需要补算的交易日")
 
+    if token and not cache_df.empty:
+        requested_mask = cache_df["trade_date"].astype(str).between(start_date, end_date)
+        close_cols = [f"{key}_close" for key in INDEX_CODES]
+        needs_index_refresh = any(
+            col not in cache_df.columns
+            or pd.to_numeric(cache_df.loc[requested_mask, col], errors="coerce").isna().any()
+            for col in close_cols
+        )
+        if needs_index_refresh:
+            index_history = _build_index_history(token, cache_df, start_date, end_date)
+            if not index_history.empty:
+                history = _normalize_trade_frame(index_history).drop_duplicates(
+                    subset=["trade_date"], keep="last"
+                )
+                history = history.set_index("trade_date")
+                repaired = cache_df.copy()
+                changed = False
+                for col in close_cols:
+                    current = (
+                        pd.to_numeric(repaired[col], errors="coerce")
+                        if col in repaired.columns
+                        else pd.Series(np.nan, index=repaired.index, dtype="float64")
+                    )
+                    if col not in history.columns:
+                        repaired[col] = current
+                        continue
+                    fresh = repaired["trade_date"].astype(str).map(
+                        pd.to_numeric(history[col], errors="coerce")
+                    )
+                    changed |= bool((current.isna() & fresh.notna()).any())
+                    repaired[col] = current.combine_first(fresh)
+                if changed:
+                    cache_df = _normalize_trade_frame(repaired)
+                    save_enhanced_cache(cache_df, cache_path)
+
     return _filter_date_range(cache_df, start_date, end_date)
 
 

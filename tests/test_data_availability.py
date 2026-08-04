@@ -11,7 +11,9 @@ from market_fear_greed.cache import (
     load_cache,
     update_fear_greed_cache,
 )
+from market_fear_greed.charts import make_history_chart
 from market_fear_greed.data_sources import load_market_fear_greed_source_data
+from market_fear_greed.fear_greed_index import _attach_index_closes
 from market_fear_greed.enhanced_index import (
     ENHANCED_CACHE_SCHEMA_VERSION,
     SENTIMENT_WEIGHTS,
@@ -34,6 +36,36 @@ class DataAvailabilityTest(unittest.TestCase):
                 "amount": [1000.0],
             }
         )
+
+    def test_index_close_attachment_fills_missing_values_without_overwriting_existing(self):
+        frame = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-07-30", "2026-07-31"]),
+                "trade_date": ["20260730", "20260731"],
+                "sh_close": [3800.0, None],
+            }
+        )
+        loaded = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-07-30", "2026-07-31"]),
+                "close": [3801.0, 3832.26],
+            }
+        )
+
+        with patch(
+            "market_fear_greed.fear_greed_index.INDEX_CODES",
+            {"sh": "000001.SH"},
+        ), patch(
+            "market_fear_greed.fear_greed_index.load_index_daily",
+            return_value=loaded,
+        ):
+            result = _attach_index_closes(
+                "token", frame, "20260730", "20260731"
+            )
+
+        self.assertEqual(result["sh_close"].tolist(), [3800.0, 3832.26])
+        self.assertNotIn("sh_close_x", result.columns)
+        self.assertNotIn("sh_close_y", result.columns)
 
     def test_postgres_trade_calendar_requires_downloaded_stock_daily(self):
         clear_cache()
@@ -114,6 +146,63 @@ class DataAvailabilityTest(unittest.TestCase):
         result = self._build_enhanced_with_daily_dates({"20260803", "20260804"})
         self.assertEqual(result["trade_date"].tolist(), ["20260803", "20260804"])
 
+    def test_enhanced_cache_repairs_missing_index_overlays_without_rebuilding_sentiment(self):
+        trade_date = "20260731"
+        row = {
+            "date": pd.Timestamp("2026-07-31"),
+            "trade_date": trade_date,
+            "afgi_enhanced": 35.0,
+            "enhanced_schema_version": ENHANCED_CACHE_SCHEMA_VERSION,
+            "sh_close": None,
+            "cyb_close": None,
+        }
+        for component in SENTIMENT_WEIGHTS:
+            row[f"{component}_status"] = "ok"
+        frame = pd.DataFrame([row])
+        index_history = pd.DataFrame(
+            {
+                "date": [pd.Timestamp("2026-07-31")],
+                "trade_date": [trade_date],
+                "sh_close": [3832.26],
+                "cyb_close": [3343.96],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "enhanced.csv"
+            frame.to_csv(cache_path, index=False, encoding="utf-8-sig")
+            with patch(
+                "market_fear_greed.enhanced_index._local_stock_daily_dates",
+                return_value=[],
+            ), patch(
+                "market_fear_greed.enhanced_index.load_trade_dates",
+                return_value=[trade_date],
+            ), patch(
+                "market_fear_greed.enhanced_index._build_index_history",
+                return_value=index_history,
+            ) as index_loader, patch(
+                "market_fear_greed.enhanced_index.build_afgi_enhanced_timeseries"
+            ) as sentiment_builder:
+                result = update_enhanced_afgi_cache(
+                    "token", trade_date, trade_date, cache_path=cache_path
+                )
+            saved = load_enhanced_cache(cache_path)
+
+        sentiment_builder.assert_not_called()
+        index_loader.assert_called_once()
+        self.assertEqual(result.loc[0, "sh_close"], 3832.26)
+        self.assertEqual(result.loc[0, "cyb_close"], 3343.96)
+        self.assertEqual(saved.loc[0, "sh_close"], 3832.26)
+        self.assertEqual(saved.loc[0, "cyb_close"], 3343.96)
+        self.assertIn(
+            "上证指数",
+            [trace.name for trace in make_history_chart(result, "上证指数").data],
+        )
+        self.assertIn(
+            "创业板指",
+            [trace.name for trace in make_history_chart(result, "创业板指").data],
+        )
+
     def test_enhanced_cache_removes_unavailable_invalid_tail(self):
         rows = {
             "date": pd.to_datetime(["2026-08-03", "2026-08-04"]),
@@ -128,9 +217,17 @@ class DataAvailabilityTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             cache_path = Path(temp_dir) / "enhanced.csv"
             frame.to_csv(cache_path, index=False, encoding="utf-8-sig")
-            with patch("market_fear_greed.enhanced_index._local_stock_daily_dates", return_value=[]), patch(
+            with patch(
+                "market_fear_greed.enhanced_index._local_stock_daily_dates", return_value=[]
+            ), patch(
                 "market_fear_greed.enhanced_index.load_trade_dates", return_value=["20260803"]
-            ), patch("market_fear_greed.enhanced_index._finalize_enhanced_scores", side_effect=lambda value: value):
+            ), patch(
+                "market_fear_greed.enhanced_index._finalize_enhanced_scores",
+                side_effect=lambda value: value,
+            ), patch(
+                "market_fear_greed.enhanced_index._build_index_history",
+                return_value=pd.DataFrame(),
+            ):
                 result = update_enhanced_afgi_cache(
                     "token", "20260803", "20260804", cache_path=cache_path
                 )

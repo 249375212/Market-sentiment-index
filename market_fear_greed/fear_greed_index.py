@@ -110,17 +110,29 @@ def score_raw_fear_greed_indicators(raw_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _attach_index_closes(token: str, df: pd.DataFrame, start_date: str, end_date: str) -> pd.DataFrame:
-    """为叠加图补充主要指数收盘价；失败时保持 AFGI 本体可用。"""
+    """为叠加图按日期补齐主要指数收盘价；已有有效值保持不变。"""
     out = df.copy()
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
     for key, code in INDEX_CODES.items():
-        if f"{key}_close" in out.columns and out[f"{key}_close"].notna().any():
+        col = f"{key}_close"
+        current = (
+            pd.to_numeric(out[col], errors="coerce")
+            if col in out.columns
+            else pd.Series(np.nan, index=out.index, dtype="float64")
+        )
+        if current.notna().all():
+            out[col] = current
             continue
         idx = load_index_daily(token, code, start_date, end_date)
         if idx.empty:
-            out[f"{key}_close"] = np.nan
+            out[col] = current
             continue
-        close = idx[["date", "close"]].rename(columns={"close": f"{key}_close"})
-        out = out.merge(close, on="date", how="left")
+        close = idx[["date", "close"]].copy()
+        close["date"] = pd.to_datetime(close["date"], errors="coerce")
+        close["close"] = pd.to_numeric(close["close"], errors="coerce")
+        close = close.dropna(subset=["date"]).drop_duplicates(subset=["date"], keep="last")
+        fresh = out["date"].map(close.set_index("date")["close"])
+        out[col] = current.combine_first(fresh)
     return out
 
 
