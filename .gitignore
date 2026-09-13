@@ -3,10 +3,13 @@ __pycache__/
 .pytest_cache/
 .coverage
 .venv/
+.venv_pg/
 venv/
 .env
 .idea/
 .vscode/
+.agents/
+.claude/
 
 .streamlit/secrets.toml
 tk.csv
