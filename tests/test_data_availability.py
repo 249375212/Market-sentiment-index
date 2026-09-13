@@ -24,6 +24,7 @@ from market_fear_greed.enhanced_index import (
 from market_fear_greed.pg_adapter import (
     clear_cache,
     pg_load_index_daily,
+    pg_load_stock_basic_safe,
     pg_load_trade_calendar,
 )
 
@@ -206,6 +207,28 @@ class DataAvailabilityTest(unittest.TestCase):
         self.assertIn("EXISTS (SELECT 1 FROM stock_daily", sql)
         self.assertEqual(params, ("20260803", "20260804"))
         self.assertEqual(result["trade_date"].tolist(), ["20260803"])
+
+    def test_postgres_stock_basic_reads_l1_industry_classification(self):
+        clear_cache()
+        query_result = pd.DataFrame(
+            {
+                "symbol": ["600000"],
+                "security_id": ["XSHG:600000"],
+                "name": ["浦发银行"],
+                "exchange": ["XSHG"],
+                "list_date": [pd.Timestamp("1999-11-10")],
+                "industry": ["银行"],
+            }
+        )
+        with patch(
+            "market_fear_greed.pg_adapter._query_df", return_value=query_result
+        ) as query:
+            result = pg_load_stock_basic_safe("PG_LOCAL")
+
+        sql = query.call_args.args[0]
+        self.assertIn("industry_info.level = 'L1'", sql)
+        self.assertNotIn("industry_info.level = 'primary'", sql)
+        self.assertEqual(result.loc[0, "industry"], "银行")
 
     def test_original_source_omits_calendar_date_without_stock_daily(self):
         empty = pd.DataFrame()

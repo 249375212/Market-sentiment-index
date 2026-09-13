@@ -205,7 +205,7 @@ def pg_load_trade_dates(token: str, start_date: str, end_date: str) -> List[str]
 def pg_load_stock_basic_safe(token: str) -> pd.DataFrame:
     """返回 [ts_code, symbol, name, market, industry, list_date]。
 
-    industry 取申万一级（industry_info.level <> 'primary'）最新有效分类。
+    industry 取申万一级（``industry_info.level = 'L1'``）最新有效分类。
     """
     def factory():
         sql = """
@@ -222,7 +222,7 @@ def pg_load_stock_basic_safe(token: str) -> pd.DataFrame:
                 SELECT industry_name
                 FROM industry_info
                 WHERE industry_info.security_id = sm.security_id
-                  AND industry_info.level = 'primary'
+                  AND industry_info.level = 'L1'
                   AND (industry_info.expire_date IS NULL
                        OR industry_info.expire_date > CURRENT_DATE)
                 ORDER BY industry_info.effective_date DESC
